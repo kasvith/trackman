@@ -42,21 +42,7 @@ fn main() {
         .and_then(|()| arg.canonicalize())
         .unwrap_or_else(|e| die(&format!("{}: {e}", arg.display())));
     let config = Config::load(&root).unwrap_or_else(|e| die(&e));
-    let (tx, rx) = mpsc::channel();
-    let mut app = App {
-        root,
-        config,
-        remotes: HashMap::new(),
-        files: None,
-        log: Vec::new(),
-        busy: false,
-        input: Input::None,
-        playlists: ListState::default().with_selected(Some(0)),
-        tracks: ListState::default(),
-        focus_tracks: false,
-        tx,
-        rx,
-    };
+    let mut app = App::new(root, config);
     app.refresh();
     let result = app.run(ratatui::init());
     ratatui::restore();
@@ -71,6 +57,24 @@ fn die(msg: &str) -> ! {
 }
 
 impl App {
+    fn new(root: PathBuf, config: Config) -> App {
+        let (tx, rx) = mpsc::channel();
+        App {
+            root,
+            config,
+            remotes: HashMap::new(),
+            files: None,
+            log: Vec::new(),
+            busy: false,
+            input: Input::None,
+            playlists: ListState::default().with_selected(Some(0)),
+            tracks: ListState::default(),
+            focus_tracks: false,
+            tx,
+            rx,
+        }
+    }
+
     fn run(&mut self, mut terminal: DefaultTerminal) -> std::io::Result<()> {
         loop {
             while let Ok(msg) = self.rx.try_recv() {
@@ -342,4 +346,57 @@ fn summary(rows: &[Row]) -> Vec<Span<'static>> {
         }
     }
     spans
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn press(app: &mut App, keys: &str) {
+        for c in keys.chars() {
+            assert!(app.key(KeyCode::Char(c)), "{c} quit");
+        }
+    }
+
+    #[test]
+    fn handles_keys() {
+        let root = env::temp_dir().join(format!("trackman-test-{}-keys", process::id()));
+        fs::create_dir_all(&root).unwrap();
+        let url = "https://soundcloud.com/you/sets/warmup/s-abc";
+        let config =
+            Config { playlists: vec![Playlist { url: url.into(), dir: "warmup".into() }], ..Default::default() };
+        let mut app = App::new(root.clone(), config);
+
+        // The share link's tracking params are dropped, so pasting the same playlist again doesn't add it twice.
+        press(&mut app, &format!("a{url}?si=q1"));
+        app.key(KeyCode::Enter);
+        app.key(KeyCode::Enter);
+        assert_eq!(app.config.playlists.len(), 1);
+        assert_eq!(app.log.last(), Some(&format!("already added: {url}")));
+
+        press(&mut app, "aother");
+        app.key(KeyCode::Esc);
+        assert!(matches!(app.input, Input::None));
+
+        // While a sync runs, q and x do nothing; Q still quits.
+        app.busy = true;
+        press(&mut app, "qx");
+        assert_eq!(app.config.playlists.len(), 1);
+        assert!(!app.key(KeyCode::Char('Q')));
+
+        app.busy = false;
+        press(&mut app, "x");
+        assert!(Config::load(&root).unwrap().playlists.is_empty());
+        assert!(!app.key(KeyCode::Char('q')));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn summarises_rows() {
+        let row = |status| Row { status, name: String::new() };
+        let rows =
+            [row(Status::Have), row(Status::Have), row(Status::New), row(Status::Link("x".into())), row(Status::Extra)];
+        let text: String = summary(&rows).iter().map(|s| s.content.as_ref()).collect();
+        assert_eq!(text, " 2/4 1 new 1 link 1 extra");
+    }
 }
