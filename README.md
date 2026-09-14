@@ -22,9 +22,34 @@ Running `scdl -l <playlist>` again re-downloads tracks you already have. Its fil
 
 - [scdl](https://github.com/scdl-org/scdl), set up so it can download your playlists. Private playlists need either their secret share link or an `auth_token` in `~/.config/scdl/scdl.cfg`.
 - `ffprobe` from ffmpeg, which scdl needs anyway.
-- Rust 1.88 or newer to build.
 
 ## Install
+
+On Linux or macOS, this installs the latest release to `/usr/local/bin`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kasvith/trackman/main/install.sh | sh
+```
+
+To install a specific version, pass it after `-s --`:
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kasvith/trackman/main/install.sh | sh -s -- v0.1.0
+```
+
+To install somewhere else, set `TRACKMAN_INSTALL_DIR`. The script asks for `sudo` only when it can't write to the folder.
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/kasvith/trackman/main/install.sh | TRACKMAN_INSTALL_DIR=~/.local/bin sh
+```
+
+On Windows, download `trackman-x86_64-pc-windows-msvc.zip` from the [latest release](https://github.com/kasvith/trackman/releases/latest) and put `trackman.exe` in a folder on your `PATH`.
+
+Each release has builds for Linux (x86_64, arm64), macOS (Intel, Apple silicon) and Windows (x86_64), and a `sha256sums.txt` that the script checks downloads against.
+
+### From source
+
+Needs Rust 1.88 or newer.
 
 ```sh
 cargo install --git https://github.com/kasvith/trackman
@@ -112,3 +137,16 @@ cargo run -- /path/to/library
 ```
 
 `src/library.rs` handles config, scanning, listing and syncing. `src/main.rs` is the TUI.
+
+CI runs `cargo test` on Linux, macOS and Windows, plus `cargo fmt --check` and `cargo clippy` on Linux, for every pull request and push to `main`.
+
+## Releasing
+
+Commit messages follow [Conventional Commits](https://www.conventionalcommits.org). To release, run this on an up-to-date `main`:
+
+```sh
+./release.sh          # next version, worked out from the commits since the last tag
+./release.sh 1.2.0    # or a version you choose
+```
+
+It needs [git-cliff](https://git-cliff.org). The script sets the version in `Cargo.toml`, updates `CHANGELOG.md`, commits, tags `vX.Y.Z` and pushes. The tag starts the Release workflow, which runs the tests, builds every platform and publishes a GitHub release with the changelog as its notes.

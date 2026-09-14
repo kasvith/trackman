@@ -334,5 +334,61 @@ mod tests {
 
         let p = Playlist { url: String::new(), dir: String::new() };
         assert_eq!(dir_name(&p, &Remote { title: "../ideas/2".into(), tracks: vec![] }), "-ideas-2");
+        assert_eq!(dir_name(&p, &Remote { title: " .. ".into(), tracks: vec![] }), "playlist");
+        let named = Playlist { url: String::new(), dir: "sets/warmup".into() };
+        assert_eq!(dir_name(&named, &Remote { title: "Warmup".into(), tracks: vec![] }), "sets/warmup");
+    }
+
+    fn temp_dir(name: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!("trackman-test-{}-{name}", std::process::id()));
+        let _ = fs::remove_dir_all(&dir);
+        fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    #[test]
+    fn config_round_trips() {
+        let root = temp_dir("config");
+        assert!(Config::load(&root).unwrap().playlists.is_empty());
+
+        let url = "https://soundcloud.com/you/sets/warmup";
+        let config = Config {
+            unavailable: vec!["775475710".into()],
+            playlists: vec![Playlist { url: url.into(), dir: "warmup".into() }],
+        };
+        config.save(&root).unwrap();
+        let loaded = Config::load(&root).unwrap();
+        assert_eq!(loaded.unavailable, ["775475710"]);
+        assert_eq!((loaded.playlists[0].url.as_str(), loaded.playlists[0].dir.as_str()), (url, "warmup"));
+
+        // Added by hand without a dir: it's filled in once the playlist title is known.
+        fs::write(root.join(CONFIG), "[[playlist]]\nurl = \"u\"\n").unwrap();
+        assert_eq!(Config::load(&root).unwrap().playlists[0].dir, "");
+
+        fs::write(root.join(CONFIG), "playlist = 3").unwrap();
+        assert!(matches!(Config::load(&root), Err(e) if e.starts_with(CONFIG)));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn scans_audio_files() {
+        let root = temp_dir("scan");
+        for f in [
+            "p/A [1].m4a",
+            "p/nested/B [2].MP3",
+            "p/Legacy.m4a",
+            "p/cover.jpg",
+            "p/.C [3].m4a",
+            ".hidden/D [4].m4a",
+            "E [5].flac",
+        ] {
+            let path = root.join(f);
+            fs::create_dir_all(path.parent().unwrap()).unwrap();
+            fs::write(path, "").unwrap();
+        }
+        let mut ids: Vec<_> = scan(&root).into_iter().map(|f| f.id.unwrap_or_default()).collect();
+        ids.sort();
+        assert_eq!(ids, ["", "1", "2", "5"]);
+        fs::remove_dir_all(&root).unwrap();
     }
 }
