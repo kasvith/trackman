@@ -164,7 +164,11 @@ impl App {
 
     fn step(&mut self, down: bool) {
         let list = if self.focus_tracks { &mut self.tracks } else { &mut self.playlists };
-        if down { list.select_next() } else { list.select_previous() }
+        if down {
+            list.select_next()
+        } else {
+            list.select_previous()
+        }
         if !self.focus_tracks {
             self.tracks = ListState::default();
         }
@@ -285,7 +289,8 @@ impl App {
         }
 
         let height = log.height.saturating_sub(2) as usize;
-        let lines: Vec<Line> = self.log[self.log.len().saturating_sub(height)..].iter().map(|l| Line::from(l.as_str())).collect();
+        let lines: Vec<Line> =
+            self.log[self.log.len().saturating_sub(height)..].iter().map(|l| Line::from(l.as_str())).collect();
         let title = if self.busy { " log · syncing… " } else { " log " };
         f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), log);
 
