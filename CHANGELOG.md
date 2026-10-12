@@ -2,6 +2,19 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.0.0] - 2026-10-12
+
+### 🚀 Features
+
+- Name downloads without [id] and track ids in trackman-index.toml
+- Update track statuses as each file downloads
+- Focus and scroll the track and log panels, with mouse support
+- Default the folder to the playlist title and tab-complete folders
+
+### 🐛 Bug Fixes
+
+- Don't mark another playlist's tracks as extra in a shared folder
+
 ## [0.1.0] - 2026-09-14
 
 ### 🚀 Features
