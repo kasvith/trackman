@@ -91,6 +91,8 @@ pub struct Row {
 pub enum Msg {
     Remote(String, Result<Remote, String>),
     Scanned(Vec<LocalFile>),
+    /// A file a sync just linked or downloaded, so the UI updates before the end-of-sync rescan.
+    File(LocalFile),
     Log(String),
     Drm(String),
     Done,
@@ -251,6 +253,7 @@ fn sync(root: &Path, p: &Playlist, unavailable: &mut Vec<String>, tx: &Sender<Ms
                 Ok(()) => {
                     index.insert(index_key(root, &dst), t.id.clone());
                     log(format!("linked {}", row.name));
+                    tx.send(Msg::File(LocalFile { path: dst, id: Some(t.id.clone()), url: None })).ok();
                 }
                 Err(e) => log(format!("link failed {}: {e}", row.name)),
             }
@@ -265,21 +268,22 @@ fn sync(root: &Path, p: &Playlist, unavailable: &mut Vec<String>, tx: &Sender<Ms
     let new = remote.tracks.len() - skip.len();
     log(format!("{new} new of {} tracks", remote.tracks.len()));
     if new > 0 {
-        let (drm, saved) = download(&p.url, &dir, &skip, tx)?;
-        for id in drm {
-            unavailable.push(id.clone());
-            tx.send(Msg::Drm(id)).ok();
-        }
-        for (id, name) in saved.lines().filter_map(saved_file) {
-            let key = index_key(root, &dir.join(&name));
+        let drm = download(&p.url, &dir, &skip, tx, |id, name| {
+            let path = dir.join(&name);
+            let key = index_key(root, &path);
             match index.get(&key) {
                 // ponytail: tracks with the same uploader and title share a filename, so only the first one is kept;
                 // download clashes again with `[id]` in the name if this comes up
                 Some(other) if *other != id => log(format!("{name} is already track {other}, skipped track {id}")),
                 _ => {
-                    index.insert(key, id);
+                    index.insert(key, id.clone());
+                    tx.send(Msg::File(LocalFile { path, id: Some(id), url: None })).ok();
                 }
             }
+        })?;
+        for id in drm {
+            unavailable.push(id.clone());
+            tx.send(Msg::Drm(id)).ok();
         }
     }
     if index != before {
@@ -290,30 +294,30 @@ fn sync(root: &Path, p: &Playlist, unavailable: &mut Vec<String>, tx: &Sender<Ms
     Ok(())
 }
 
-/// Runs scdl on the playlist with `skip` pre-recorded as downloaded.
-/// Returns ids that failed as DRM protected, and an `id path` line for each file scdl saved.
-fn download(url: &str, dir: &Path, skip: &[&str], tx: &Sender<Msg>) -> Result<(Vec<String>, String), String> {
-    let tmp = std::env::temp_dir();
-    let archive = tmp.join(format!("trackman-{}.txt", std::process::id()));
-    // yt-dlp appends `id path` here after moving each file into place. The name is relative to scdl's working dir,
-    // so it needs no quoting inside --yt-dlp-args, and yt-dlp (which reads it as a template) finds no `%` in it.
-    let saved = format!("trackman-{}-saved.txt", std::process::id());
-    let cleanup = || {
-        fs::remove_file(&archive).ok();
-        fs::remove_file(tmp.join(&saved)).ok();
-    };
+/// Runs scdl on the playlist with `skip` pre-recorded as downloaded. Calls `saved(id, file name)` as each file
+/// lands. Returns ids that failed as DRM protected.
+fn download(
+    url: &str,
+    dir: &Path,
+    skip: &[&str],
+    tx: &Sender<Msg>,
+    mut saved: impl FnMut(String, String),
+) -> Result<Vec<String>, String> {
+    let archive = std::env::temp_dir().join(format!("trackman-{}.txt", std::process::id()));
     let lines: String = skip.iter().map(|id| format!("soundcloud {id}\n")).collect();
     fs::write(&archive, lines).map_err(|e| format!("{}: {e}", archive.display()))?;
 
     let spawned = Command::new("scdl")
         .args(["-l", url, "--no-playlist-folder", "--hide-progress", "--playlist-name-format", NAME_FORMAT])
-        .arg("--yt-dlp-args")
-        .arg(format!("--no-update --print-to-file 'after_move:%(id)s %(filepath)s' {saved}"))
+        // scdl logs everything (its own and yt-dlp's) to stderr, so stdout carries only these `id path` lines,
+        // which yt-dlp prints and flushes as each file is moved into place.
+        .args(["--yt-dlp-args", "--no-update --print 'after_move:%(id)s %(filepath)s'"])
         .arg("--path")
         .arg(dir)
         .arg("--download-archive")
         .arg(&archive)
-        .current_dir(&tmp)
+        // scdl writes the playlist cover to `..jpg` in its working dir; keep it out of the library and the user's cwd.
+        .current_dir(std::env::temp_dir())
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -321,7 +325,7 @@ fn download(url: &str, dir: &Path, skip: &[&str], tx: &Sender<Msg>) -> Result<(V
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            cleanup();
+            fs::remove_file(&archive).ok();
             return Err(format!("scdl: {e}"));
         }
     };
@@ -338,20 +342,23 @@ fn download(url: &str, dir: &Path, skip: &[&str], tx: &Sender<Msg>) -> Result<(V
             .collect::<Vec<_>>()
     });
     for line in BufReader::new(stdout).lines().map_while(Result::ok) {
-        tx.send(Msg::Log(line)).ok();
+        match saved_file(&line) {
+            Some((id, name)) => saved(id, name),
+            None => {
+                tx.send(Msg::Log(line)).ok();
+            }
+        }
     }
     let drm = errors.join().unwrap_or_default();
     let status = child.wait();
-    // Read even if scdl failed part way: every line is a file that made it to disk.
-    let files = fs::read_to_string(tmp.join(&saved)).unwrap_or_default();
-    cleanup();
+    fs::remove_file(&archive).ok();
     // scdl exits non-zero when any track fails (DRM included); the log already shows why.
     if let Ok(s) = status
         && !s.success()
     {
         tx.send(Msg::Log(format!("scdl finished with {s}"))).ok();
     }
-    Ok((drm, files))
+    Ok(drm)
 }
 
 /// `ERROR: [soundcloud] 775475710: This video is DRM protected` -> `775475710`
@@ -365,6 +372,9 @@ fn drm_id(line: &str) -> Option<&str> {
 /// `2383362741 /lib/warmup/Marsh - Aloft.m4a` -> `("2383362741", "Marsh - Aloft.m4a")`
 fn saved_file(line: &str) -> Option<(String, String)> {
     let (id, path) = line.split_once(' ')?;
+    if id.is_empty() || !id.bytes().all(|b| b.is_ascii_digit()) {
+        return None;
+    }
     Some((id.to_string(), Path::new(path).file_name()?.to_string_lossy().into_owned()))
 }
 
@@ -410,6 +420,7 @@ mod tests {
         assert_eq!(drm_id("ERROR: [soundcloud] 775475710: HTTP Error 404"), None);
         assert_eq!(saved_file("123 /lib/warmup/Marsh - Aloft.m4a"), Some(("123".into(), "Marsh - Aloft.m4a".into())));
         assert_eq!(saved_file(""), None);
+        assert_eq!(saved_file("[soundcloud] 123: oops"), None);
 
         let p = Playlist { url: String::new(), dir: String::new() };
         assert_eq!(dir_name(&p, &Remote { title: "../ideas/2".into(), tracks: vec![] }), "-ideas-2");

@@ -104,6 +104,12 @@ impl App {
                 self.remotes.insert(url, remote);
             }
             Msg::Scanned(files) => self.files = Some(files),
+            Msg::File(f) => {
+                // While a scan is running, that scan's result replaces `files` anyway.
+                if let Some(files) = &mut self.files {
+                    files.push(f);
+                }
+            }
             Msg::Log(line) => self.push_log(line),
             Msg::Drm(id) => {
                 if !self.config.unavailable.contains(&id) {

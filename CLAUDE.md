@@ -27,9 +27,9 @@ Two files. `src/library.rs` holds everything that touches disk or external proce
 **Sync flow.** For each playlist, `sync`:
 1. Hardlinks `Link` rows, copying instead when the folders are on different drives.
 2. Writes a temporary scdl `--download-archive` file listing every track *not* marked `New`.
-3. Runs scdl once, so it downloads exactly the new tracks. yt-dlp's `--print-to-file after_move:` writes `id path` for each saved file.
+3. Runs scdl once, so it downloads exactly the new tracks. scdl logs everything to stderr, so stdout carries only the `id path` line yt-dlp's `--print after_move:` prints as each file lands.
 4. Parses scdl's stderr for DRM errors and sends each id as `Msg::Drm`. `App` then saves those ids to `unavailable` in the config.
-5. Adds linked and saved files to the index and writes it if anything changed.
+5. Sends each linked or saved file as `Msg::File` as it lands, so rows update before the end-of-sync rescan. Adds them to the index and writes it if anything changed.
 
 **Config.** `trackman.toml` lives at the library root. A playlist added with a blank `dir` gets its folder from the SoundCloud title (`dir_name`) when the first `Msg::Remote` arrives.
 
