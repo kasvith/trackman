@@ -14,7 +14,7 @@ Running `scdl -l <playlist>` again re-downloads tracks you already have. Its fil
 - Downloads only tracks that aren't already in the playlist's folder.
 - A track already saved in another playlist's folder is hardlinked, not downloaded: no extra disk space, and it shows up as a normal file in both folders.
 - DRM-protected tracks (which can't be downloaded) are recorded and skipped on later syncs.
-- Files are never renamed or moved. New downloads are named `Uploader - Title [id].m4a`, with no playlist position.
+- Files are never renamed or moved. New downloads are named `Uploader - Title.m4a`, with no playlist position and no track ID for DJ software to mistake for part of the title or album. `trackman-index.toml` remembers which track each file is. Files from older versions keep their `[id]` names and are still recognised.
 - Recognises files downloaded earlier with scdl through the SoundCloud URL scdl embeds in each file.
 - Tracks removed from a SoundCloud playlist are shown as `extra` and never deleted.
 
@@ -95,8 +95,9 @@ Each track's status:
 ```
 ~/Music/deejay/
 ├── trackman.toml
+├── trackman-index.toml
 ├── ideas 2/
-│   ├── Marsh - Marsh - Aloft [2383362741].m4a
+│   ├── Marsh - Marsh - Aloft.m4a
 │   └── ...
 └── warmup/
     └── ...
@@ -114,18 +115,21 @@ dir = "warmup"
 
 `dir` is relative to the library root and can be nested, e.g. `sets/2026/warmup`.
 
+`trackman-index.toml` maps each file trackman downloads or links to its track ID, e.g. `"ideas 2/Marsh - Marsh - Aloft.m4a" = "2383362741"`. trackman keeps it up to date during syncs. If you rename a file, rename its entry too.
+
 ## How a sync works
 
 1. Lists the playlist with `scdl --yt-dlp-args "--flat-playlist -J"`. This uses your scdl login and downloads nothing.
-2. Scans the library root. A file's track ID comes from `[id]` in its name, or from the URL tag scdl embeds (`WWWAUDIOFILE`) for older files.
+2. Scans the library root. A file's track ID comes from `trackman-index.toml`, or from `[id]` in its name (files from older versions). Failing both, trackman reads the URL tag scdl embeds (`WWWAUDIOFILE`).
 3. Hardlinks tracks found in other folders (falls back to copying if the folders are on different drives).
 4. Writes a temporary scdl archive file listing every track it shouldn't download, then runs scdl on the playlist once, so scdl downloads exactly the new tracks.
-5. Saves the IDs of any tracks that failed as DRM protected to `unavailable`.
+5. Records each linked and downloaded file in `trackman-index.toml`, and saves the IDs of any tracks that failed as DRM protected to `unavailable`.
 
 ## Limitations
 
-- Older files without `[id]` in their name are matched by their SoundCloud URL. If an uploader changes their profile URL, trackman won't recognise the file and will download the track again.
-- Older MP3 files without `[id]` in their name haven't been tested; only M4A has.
+- Files with no known ID (not in the index, no `[id]` in their name) are matched by their SoundCloud URL. If an uploader changes their profile URL, trackman won't recognise the file and will download the track again. This includes files trackman downloaded if `trackman-index.toml` is lost.
+- MP3 files matched by URL haven't been tested; only M4A has.
+- Two tracks with the same uploader and title in one folder would get the same filename. Only the first is downloaded; the log names the clash.
 - Duplicate files already on disk aren't cleaned up.
 - To retry a DRM-protected track, delete its ID from `unavailable`.
 

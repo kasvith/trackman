@@ -1,6 +1,8 @@
 //! Everything that touches disk or scdl: config, scanning the library, listing playlists, syncing.
 
+use serde::de::DeserializeOwned;
 use serde::{Deserialize, Serialize};
+use std::collections::BTreeMap;
 use std::io::{BufRead, BufReader, ErrorKind};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Stdio};
@@ -8,9 +10,15 @@ use std::sync::mpsc::Sender;
 use std::{fs, thread};
 
 pub const CONFIG: &str = "trackman.toml";
-/// No playlist position in the name: reordering a playlist must never change a filename.
-const NAME_FORMAT: &str = "%(uploader)s - %(title)s [%(id)s].%(ext)s";
+/// Maps each file trackman downloaded or linked to its track, since the filename doesn't carry the id.
+const INDEX: &str = "trackman-index.toml";
+/// No playlist position: reordering a playlist must never change a filename.
+/// No `[id]`: DJ software reads it as part of the title or album. `INDEX` holds the id instead.
+const NAME_FORMAT: &str = "%(uploader)s - %(title)s.%(ext)s";
 const AUDIO: &[&str] = &["m4a", "mp3", "opus", "flac", "wav", "aiff", "ogg"];
+
+/// File path relative to the library root, `/`-separated on every OS, to track id.
+type Index = BTreeMap<String, String>;
 
 #[derive(Serialize, Deserialize, Default)]
 pub struct Config {
@@ -31,15 +39,20 @@ pub struct Playlist {
 
 impl Config {
     pub fn load(root: &Path) -> Result<Config, String> {
-        match fs::read_to_string(root.join(CONFIG)) {
-            Ok(s) => toml::from_str(&s).map_err(|e| format!("{CONFIG}: {e}")),
-            Err(e) if e.kind() == ErrorKind::NotFound => Ok(Config::default()),
-            Err(e) => Err(format!("{CONFIG}: {e}")),
-        }
+        load(root, CONFIG)
     }
 
     pub fn save(&self, root: &Path) -> std::io::Result<()> {
         fs::write(root.join(CONFIG), toml::to_string_pretty(self).expect("config serializes"))
+    }
+}
+
+/// Reads a TOML file at the library root. A missing file reads as the default.
+fn load<T: DeserializeOwned + Default>(root: &Path, name: &str) -> Result<T, String> {
+    match fs::read_to_string(root.join(name)) {
+        Ok(s) => toml::from_str(&s).map_err(|e| format!("{name}: {e}")),
+        Err(e) if e.kind() == ErrorKind::NotFound => Ok(T::default()),
+        Err(e) => Err(format!("{name}: {e}")),
     }
 }
 
@@ -56,9 +69,9 @@ pub struct Remote {
 
 pub struct LocalFile {
     pub path: PathBuf,
-    /// From `[id]` at the end of the filename (files trackman downloaded).
+    /// From the index, or from `[id]` at the end of the filename (downloads from older trackman versions).
     pub id: Option<String>,
-    /// From the WWWAUDIOFILE tag scdl embeds (older files without an id in the name).
+    /// From the WWWAUDIOFILE tag scdl embeds (files with no known id).
     pub url: Option<String>,
 }
 
@@ -113,12 +126,22 @@ pub fn fetch(url: &str) -> Result<Remote, String> {
 }
 
 pub fn scan(root: &Path) -> Vec<LocalFile> {
-    let mut files = Vec::new();
-    walk(root, &mut files);
-    files
+    // An unreadable index only slows this down (its files fall back to the URL tag); sync refuses to overwrite it.
+    let index: Index = load(root, INDEX).unwrap_or_default();
+    let mut paths = Vec::new();
+    walk(root, &mut paths);
+    (paths.into_iter())
+        .map(|path| {
+            // Index first: a title like "Intro [2024]" puts `[digits]` at the end of a new filename.
+            let id = index.get(&index_key(root, &path)).cloned().or_else(|| id_from_name(&path));
+            // ponytail: one ffprobe per file without a known id (~30ms each); cache by path+mtime if big libraries feel slow
+            let url = if id.is_none() { url_tag(&path) } else { None };
+            LocalFile { path, id, url }
+        })
+        .collect()
 }
 
-fn walk(dir: &Path, files: &mut Vec<LocalFile>) {
+fn walk(dir: &Path, paths: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else { return };
     for entry in entries.flatten() {
         let path = entry.path();
@@ -126,18 +149,20 @@ fn walk(dir: &Path, files: &mut Vec<LocalFile>) {
             continue;
         }
         if entry.file_type().is_ok_and(|t| t.is_dir()) {
-            walk(&path, files);
+            walk(&path, paths);
             continue;
         }
         let ext = path.extension().and_then(|e| e.to_str()).unwrap_or_default().to_ascii_lowercase();
-        if !AUDIO.contains(&ext.as_str()) {
-            continue;
+        if AUDIO.contains(&ext.as_str()) {
+            paths.push(path);
         }
-        let id = id_from_name(&path);
-        // ponytail: one ffprobe per file without an [id] (~30ms each); cache by path+mtime if big libraries feel slow
-        let url = if id.is_none() { url_tag(&path) } else { None };
-        files.push(LocalFile { path, id, url });
     }
+}
+
+/// `<root>/sets/warmup/A.m4a` -> `sets/warmup/A.m4a`, with `/` on every OS so a library drive works on any machine.
+fn index_key(root: &Path, path: &Path) -> String {
+    let rel = path.strip_prefix(root).unwrap_or(path);
+    rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
 }
 
 fn id_from_name(path: &Path) -> Option<String> {
@@ -203,10 +228,14 @@ fn sync(root: &Path, p: &Playlist, unavailable: &mut Vec<String>, tx: &Sender<Ms
     };
     let remote = fetch(&p.url)?;
     let dir = root.join(dir_name(p, &remote));
+    // Loaded before anything changes on disk, so an unreadable index stops the sync instead of being overwritten.
+    let mut index: Index = load(root, INDEX)?;
+    let before = index.clone();
     let rows = plan(&remote, &scan(root), &dir, unavailable);
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
-    for row in &rows {
+    // Rows start with one per track, in playlist order, so zip pairs each Link row with its track.
+    for (t, row) in remote.tracks.iter().zip(&rows) {
         if let Status::Link(src) = &row.status {
             let dst = dir.join(&row.name);
             let linked = match fs::hard_link(src, &dst) {
@@ -214,7 +243,10 @@ fn sync(root: &Path, p: &Playlist, unavailable: &mut Vec<String>, tx: &Sender<Ms
                 r => r,
             };
             match linked {
-                Ok(()) => log(format!("linked {}", row.name)),
+                Ok(()) => {
+                    index.insert(index_key(root, &dst), t.id.clone());
+                    log(format!("linked {}", row.name));
+                }
                 Err(e) => log(format!("link failed {}: {e}", row.name)),
             }
         }
@@ -228,28 +260,55 @@ fn sync(root: &Path, p: &Playlist, unavailable: &mut Vec<String>, tx: &Sender<Ms
     let new = remote.tracks.len() - skip.len();
     log(format!("{new} new of {} tracks", remote.tracks.len()));
     if new > 0 {
-        for id in download(&p.url, &dir, &skip, tx)? {
+        let (drm, saved) = download(&p.url, &dir, &skip, tx)?;
+        for id in drm {
             unavailable.push(id.clone());
             tx.send(Msg::Drm(id)).ok();
         }
+        for (id, name) in saved.lines().filter_map(saved_file) {
+            let key = index_key(root, &dir.join(&name));
+            match index.get(&key) {
+                // ponytail: tracks with the same uploader and title share a filename, so only the first one is kept;
+                // download clashes again with `[id]` in the name if this comes up
+                Some(other) if *other != id => log(format!("{name} is already track {other}, skipped track {id}")),
+                _ => {
+                    index.insert(key, id);
+                }
+            }
+        }
+    }
+    if index != before {
+        fs::write(root.join(INDEX), toml::to_string_pretty(&index).expect("index serializes"))
+            .map_err(|e| format!("{INDEX}: {e}"))?;
     }
     tx.send(Msg::Remote(p.url.clone(), Ok(remote))).ok();
     Ok(())
 }
 
-/// Runs scdl on the playlist with `skip` pre-recorded as downloaded. Returns ids that failed as DRM protected.
-fn download(url: &str, dir: &Path, skip: &[&str], tx: &Sender<Msg>) -> Result<Vec<String>, String> {
-    let archive = std::env::temp_dir().join(format!("trackman-{}.txt", std::process::id()));
+/// Runs scdl on the playlist with `skip` pre-recorded as downloaded.
+/// Returns ids that failed as DRM protected, and an `id path` line for each file scdl saved.
+fn download(url: &str, dir: &Path, skip: &[&str], tx: &Sender<Msg>) -> Result<(Vec<String>, String), String> {
+    let tmp = std::env::temp_dir();
+    let archive = tmp.join(format!("trackman-{}.txt", std::process::id()));
+    // yt-dlp appends `id path` here after moving each file into place. The name is relative to scdl's working dir,
+    // so it needs no quoting inside --yt-dlp-args, and yt-dlp (which reads it as a template) finds no `%` in it.
+    let saved = format!("trackman-{}-saved.txt", std::process::id());
+    let cleanup = || {
+        fs::remove_file(&archive).ok();
+        fs::remove_file(tmp.join(&saved)).ok();
+    };
     let lines: String = skip.iter().map(|id| format!("soundcloud {id}\n")).collect();
     fs::write(&archive, lines).map_err(|e| format!("{}: {e}", archive.display()))?;
 
     let spawned = Command::new("scdl")
         .args(["-l", url, "--no-playlist-folder", "--hide-progress", "--playlist-name-format", NAME_FORMAT])
-        .args(["--yt-dlp-args", "--no-update"])
+        .arg("--yt-dlp-args")
+        .arg(format!("--no-update --print-to-file 'after_move:%(id)s %(filepath)s' {saved}"))
         .arg("--path")
         .arg(dir)
         .arg("--download-archive")
         .arg(&archive)
+        .current_dir(&tmp)
         .stdin(Stdio::null())
         .stdout(Stdio::piped())
         .stderr(Stdio::piped())
@@ -257,7 +316,7 @@ fn download(url: &str, dir: &Path, skip: &[&str], tx: &Sender<Msg>) -> Result<Ve
     let mut child = match spawned {
         Ok(child) => child,
         Err(e) => {
-            fs::remove_file(&archive).ok();
+            cleanup();
             return Err(format!("scdl: {e}"));
         }
     };
@@ -278,14 +337,16 @@ fn download(url: &str, dir: &Path, skip: &[&str], tx: &Sender<Msg>) -> Result<Ve
     }
     let drm = errors.join().unwrap_or_default();
     let status = child.wait();
-    fs::remove_file(&archive).ok();
+    // Read even if scdl failed part way: every line is a file that made it to disk.
+    let files = fs::read_to_string(tmp.join(&saved)).unwrap_or_default();
+    cleanup();
     // scdl exits non-zero when any track fails (DRM included); the log already shows why.
     if let Ok(s) = status
         && !s.success()
     {
         tx.send(Msg::Log(format!("scdl finished with {s}"))).ok();
     }
-    Ok(drm)
+    Ok((drm, files))
 }
 
 /// `ERROR: [soundcloud] 775475710: This video is DRM protected` -> `775475710`
@@ -294,6 +355,12 @@ fn drm_id(line: &str) -> Option<&str> {
         return None;
     }
     line.split("] ").nth(1)?.split(':').next()
+}
+
+/// `2383362741 /lib/warmup/Marsh - Aloft.m4a` -> `("2383362741", "Marsh - Aloft.m4a")`
+fn saved_file(line: &str) -> Option<(String, String)> {
+    let (id, path) = line.split_once(' ')?;
+    Some((id.to_string(), Path::new(path).file_name()?.to_string_lossy().into_owned()))
 }
 
 #[cfg(test)]
@@ -331,6 +398,8 @@ mod tests {
         assert_eq!(id_from_name(Path::new("d/Mind Opener [Meanwhile].m4a")), None);
         assert_eq!(drm_id("ERROR: [soundcloud] 775475710: This video is DRM protected"), Some("775475710"));
         assert_eq!(drm_id("ERROR: [soundcloud] 775475710: HTTP Error 404"), None);
+        assert_eq!(saved_file("123 /lib/warmup/Marsh - Aloft.m4a"), Some(("123".into(), "Marsh - Aloft.m4a".into())));
+        assert_eq!(saved_file(""), None);
 
         let p = Playlist { url: String::new(), dir: String::new() };
         assert_eq!(dir_name(&p, &Remote { title: "../ideas/2".into(), tracks: vec![] }), "-ideas-2");
@@ -376,6 +445,8 @@ mod tests {
         for f in [
             "p/A [1].m4a",
             "p/nested/B [2].MP3",
+            "p/nested/Indexed.m4a",
+            "p/Intro [2024].m4a",
             "p/Legacy.m4a",
             "p/cover.jpg",
             "p/.C [3].m4a",
@@ -386,9 +457,12 @@ mod tests {
             fs::create_dir_all(path.parent().unwrap()).unwrap();
             fs::write(path, "").unwrap();
         }
+        let index =
+            Index::from([("p/nested/Indexed.m4a".into(), "6".into()), ("p/Intro [2024].m4a".into(), "7".into())]);
+        fs::write(root.join(INDEX), toml::to_string_pretty(&index).unwrap()).unwrap();
         let mut ids: Vec<_> = scan(&root).into_iter().map(|f| f.id.unwrap_or_default()).collect();
         ids.sort();
-        assert_eq!(ids, ["", "1", "2", "5"]);
+        assert_eq!(ids, ["", "1", "2", "5", "6", "7"]);
         fs::remove_dir_all(&root).unwrap();
     }
 }
