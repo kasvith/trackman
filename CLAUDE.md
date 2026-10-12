@@ -22,25 +22,28 @@ Two files. `src/library.rs` holds everything that touches disk or external proce
 
 **Threading.** Slow work runs on spawned threads that report back through an `mpsc` channel of `library::Msg`. `App::run` drains the channel, redraws, and polls keys every 200ms. On refresh, each playlist gets its own `fetch` thread and the library scan gets one more. `sync_all` runs playlists one after another on a single worker thread; `App.busy` guards against starting a second sync.
 
-**Planning is pure.** `plan(remote, files, dir, unavailable)` turns a playlist's remote tracks and the scanned local files into `Row`s with one of five statuses: `Have`, `Link`, `New`, `Drm`, `Extra`. The UI recomputes rows every frame, and `sync` uses the same function, so status logic lives only there. A local file matches a track by the `[id]` in its filename, or by the `WWWAUDIOFILE` URL tag read with `ffprobe` (for older scdl files without an id).
+**Planning is pure.** `plan(remote, shared, files, dir, unavailable)` turns a playlist's remote tracks and the scanned local files into `Row`s with one of five statuses: `Have`, `Link`, `New`, `Drm`, `Extra`. The UI recomputes rows every frame, and `sync` uses the same function, so status logic lives only there. Several playlists can share a folder: `shared` holds the others' remotes, so their files aren't `Extra`. A local file matches a track by id, looked up in the index or, for files from older versions, taken from `[id]` at the end of the filename. Files with no known id match by the `WWWAUDIOFILE` URL tag read with `ffprobe`.
 
 **Sync flow.** For each playlist, `sync`:
 1. Hardlinks `Link` rows, copying instead when the folders are on different drives.
 2. Writes a temporary scdl `--download-archive` file listing every track *not* marked `New`.
-3. Runs scdl once, so it downloads exactly the new tracks.
+3. Runs scdl once, so it downloads exactly the new tracks. scdl logs everything to stderr, so stdout carries only the `id path` line yt-dlp's `--print after_move:` prints as each file lands.
 4. Parses scdl's stderr for DRM errors and sends each id as `Msg::Drm`. `App` then saves those ids to `unavailable` in the config.
+5. Sends each linked or saved file as `Msg::File` as it lands, so rows update before the end-of-sync rescan. Adds them to the index and writes it if anything changed.
 
-**Config.** `trackman.toml` lives at the library root. A playlist added with a blank `dir` gets its folder from the SoundCloud title (`dir_name`) when the first `Msg::Remote` arrives.
+**Config.** `trackman.toml` lives at the library root. Entering a playlist URL starts its listing, so the folder prompt can show the title as the default. A blank `dir` takes the title (`dir_name`) when the playlist is added, or when the first `Msg::Remote` arrives if the listing is still loading.
+
+**Index.** `trackman-index.toml`, also at the root, maps file paths (relative, `/`-separated) to track ids, because `NAME_FORMAT` leaves the id out. Only `sync` writes it, on the worker thread. `App` never holds it. An existing entry is never overwritten by a download: a different id for the same path is a filename clash and gets logged.
 
 ## Invariants
 
 - Never rename, move or delete files in the library. Tracks removed from a playlist show as `Extra` and are left alone.
-- `NAME_FORMAT` deliberately has no playlist position. Reordering a playlist must never change a filename.
+- `NAME_FORMAT` deliberately has no playlist position and no id. Reordering a playlist must never change a filename, and DJ software misreads `[id]` as part of the title or album.
 - `ponytail:` comments mark deliberate simplifications and name their limit and the upgrade path. Keep them accurate when changing that code.
 
 ## Tests
 
-Tests don't need scdl or ffprobe. When ffprobe is missing, `url_tag` returns `None`. Filesystem tests use per-test folders under `std::env::temp_dir()` (there's no tempfile crate). UI logic is tested without a terminal through `App::new(root, config)` and `app.key(KeyCode::…)`. Avoid tests that add a *new* playlist URL, because `App::add` starts a real `scdl` fetch thread.
+Tests don't need scdl or ffprobe. When ffprobe is missing, `url_tag` returns `None`. Filesystem tests use per-test folders under `std::env::temp_dir()` (there's no tempfile crate). UI logic is tested without a terminal through `App::new(root, config)` and `app.key(KeyCode::…)`. Avoid tests that enter a *new* playlist URL, because that starts a real `scdl` fetch thread. To test the folder prompt, set `app.input = Input::Dir { … }` directly. `draw` runs against ratatui's `TestBackend`.
 
 ## Releases
 

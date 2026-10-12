@@ -1,13 +1,18 @@
 mod library;
 
 use library::{Config, LocalFile, Msg, Playlist, Remote, Row, Status};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -16,8 +21,23 @@ use std::{env, fs, process, thread};
 enum Input {
     None,
     Url(String),
-    Dir { url: String, buf: String },
+    /// `menu` holds folder completions after Tab, and `pick` the one Tab cycled to.
+    Dir {
+        url: String,
+        buf: String,
+        menu: Vec<String>,
+        pick: Option<usize>,
+    },
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Pane {
+    Playlists,
+    Tracks,
+    Log,
+}
+
+const PANES: [Pane; 3] = [Pane::Playlists, Pane::Tracks, Pane::Log];
 
 struct App {
     root: PathBuf,
@@ -31,7 +51,11 @@ struct App {
     input: Input,
     playlists: ListState,
     tracks: ListState,
-    focus_tracks: bool,
+    focus: Pane,
+    /// Lines scrolled up from the newest; 0 follows new output.
+    log_scroll: usize,
+    /// Where each pane was last drawn, indexed by `Pane`, for the mouse and page keys.
+    areas: [Rect; 3],
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -44,7 +68,11 @@ fn main() {
     let config = Config::load(&root).unwrap_or_else(|e| die(&e));
     let mut app = App::new(root, config);
     app.refresh();
-    let result = app.run(ratatui::init());
+    let terminal = ratatui::init();
+    // ponytail: mouse capture stops plain drag-to-select; most terminals still select with Shift or Option held
+    execute!(stdout(), EnableMouseCapture).ok();
+    let result = app.run(terminal);
+    execute!(stdout(), DisableMouseCapture).ok();
     ratatui::restore();
     if let Err(e) = result {
         die(&e.to_string());
@@ -69,7 +97,9 @@ impl App {
             input: Input::None,
             playlists: ListState::default().with_selected(Some(0)),
             tracks: ListState::default(),
-            focus_tracks: false,
+            focus: Pane::Playlists,
+            log_scroll: 0,
+            areas: [Rect::default(); 3],
             tx,
             rx,
         }
@@ -81,12 +111,13 @@ impl App {
                 self.handle(msg);
             }
             terminal.draw(|f| self.draw(f))?;
-            if event::poll(Duration::from_millis(200))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && !self.key(key.code)
-            {
-                return Ok(());
+            if !event::poll(Duration::from_millis(200))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press && !self.key(key.code) => return Ok(()),
+                Event::Mouse(m) => self.mouse(m),
+                _ => {}
             }
         }
     }
@@ -104,6 +135,12 @@ impl App {
                 self.remotes.insert(url, remote);
             }
             Msg::Scanned(files) => self.files = Some(files),
+            Msg::File(f) => {
+                // While a scan is running, that scan's result replaces `files` anyway.
+                if let Some(files) = &mut self.files {
+                    files.push(f);
+                }
+            }
             Msg::Log(line) => self.push_log(line),
             Msg::Drm(id) => {
                 if !self.config.unavailable.contains(&id) {
@@ -122,7 +159,13 @@ impl App {
                 KeyCode::Enter if !buf.trim().is_empty() => {
                     // Share links carry tracking params; the secret s-… token is in the path, so keep that.
                     let url = buf.trim().split('?').next().unwrap_or_default().to_string();
-                    self.input = Input::Dir { url, buf: String::new() };
+                    if self.config.playlists.iter().any(|p| p.url == url) {
+                        self.push_log(format!("already added: {url}"));
+                    } else {
+                        // Listed now, so the folder prompt can show the playlist title as its default.
+                        self.fetch(url.clone());
+                        self.input = Input::Dir { url, buf: String::new(), menu: Vec::new(), pick: None };
+                    }
                 }
                 KeyCode::Esc => {}
                 code => {
@@ -130,12 +173,39 @@ impl App {
                     self.input = Input::Url(buf);
                 }
             },
-            Input::Dir { url, mut buf } => match code {
+            Input::Dir { url, mut buf, mut menu, mut pick } => match code {
                 KeyCode::Enter => self.add(url, buf.trim().trim_matches('/').to_string()),
-                KeyCode::Esc => {}
+                KeyCode::Esc if menu.is_empty() => {}
+                // zsh style: the first Tab fills in what all matches share, the next ones cycle through them.
+                KeyCode::Tab | KeyCode::BackTab => {
+                    if menu.is_empty() {
+                        menu = library::complete_dir(&self.root, &buf);
+                        let shared = common_prefix(&menu);
+                        if shared.len() > buf.len() {
+                            buf = shared.to_string();
+                        }
+                        if menu.len() == 1 {
+                            menu.clear();
+                        }
+                    } else {
+                        let (n, back) = (menu.len(), code == KeyCode::BackTab);
+                        let i = match pick {
+                            None if back => n - 1,
+                            None => 0,
+                            Some(i) if back => (i + n - 1) % n,
+                            Some(i) => (i + 1) % n,
+                        };
+                        pick = Some(i);
+                        buf = menu[i].clone();
+                    }
+                    self.input = Input::Dir { url, buf, menu, pick };
+                }
                 code => {
-                    edit(&mut buf, code);
-                    self.input = Input::Dir { url, buf };
+                    // A completed folder ends in `/`, so typing `/` next to it just goes into that folder.
+                    if !(code == KeyCode::Char('/') && buf.ends_with('/')) {
+                        edit(&mut buf, code);
+                    }
+                    self.input = Input::Dir { url, buf, menu: Vec::new(), pick: None };
                 }
             },
             Input::None => match code {
@@ -157,39 +227,83 @@ impl App {
                         self.push_log(format!("removed {} (files kept)", p.url));
                     }
                 }
-                KeyCode::Tab => self.focus_tracks = !self.focus_tracks,
-                KeyCode::Down | KeyCode::Char('j') => self.step(true),
-                KeyCode::Up | KeyCode::Char('k') => self.step(false),
+                KeyCode::Tab => self.focus = PANES[(self.focus as usize + 1) % 3],
+                KeyCode::BackTab => self.focus = PANES[(self.focus as usize + 2) % 3],
+                KeyCode::Down | KeyCode::Char('j') => self.scroll(self.focus, true, 1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll(self.focus, false, 1),
+                KeyCode::PageDown => self.scroll(self.focus, true, self.page()),
+                KeyCode::PageUp => self.scroll(self.focus, false, self.page()),
+                KeyCode::End | KeyCode::Char('G') => self.scroll(self.focus, true, u16::MAX),
+                KeyCode::Home | KeyCode::Char('g') => self.scroll(self.focus, false, u16::MAX),
                 _ => {}
             },
         }
         true
     }
 
-    fn step(&mut self, down: bool) {
-        let list = if self.focus_tracks { &mut self.tracks } else { &mut self.playlists };
-        if down {
-            list.select_next()
-        } else {
-            list.select_previous()
+    /// Clicking focuses a pane and picks the row under the pointer; the wheel scrolls the pane under it.
+    fn mouse(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        let Some(pane) = PANES.into_iter().find(|&p| self.areas[p as usize].contains(pos)) else { return };
+        let area = self.areas[pane as usize];
+        match m.kind {
+            MouseEventKind::ScrollDown => self.scroll(pane, true, 3),
+            MouseEventKind::ScrollUp => self.scroll(pane, false, 3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = pane;
+                // Inside the border only.
+                if m.row > area.y
+                    && m.row + 1 < area.bottom()
+                    && let Some(list) = self.list(pane)
+                {
+                    list.select(Some(list.offset() + (m.row - area.y - 1) as usize));
+                }
+            }
+            _ => {}
         }
-        if !self.focus_tracks {
-            self.tracks = ListState::default();
+    }
+
+    /// The list shown in `pane`. Moving through playlists starts the track list over from the top.
+    fn list(&mut self, pane: Pane) -> Option<&mut ListState> {
+        match pane {
+            Pane::Playlists => {
+                self.tracks = ListState::default();
+                Some(&mut self.playlists)
+            }
+            Pane::Tracks => Some(&mut self.tracks),
+            Pane::Log => None,
         }
+    }
+
+    /// Moves `n` rows. Lists clamp to their last row when drawn, the log in `draw`.
+    fn scroll(&mut self, pane: Pane, down: bool, n: u16) {
+        match self.list(pane) {
+            Some(list) if down => list.scroll_down_by(n),
+            Some(list) => list.scroll_up_by(n),
+            None if down => self.log_scroll = self.log_scroll.saturating_sub(n.into()),
+            None => self.log_scroll = self.log_scroll.saturating_add(n.into()),
+        }
+    }
+
+    /// Rows inside the focused pane's border.
+    fn page(&self) -> u16 {
+        self.areas[self.focus as usize].height.saturating_sub(2).max(1)
     }
 
     fn selected(&self) -> Option<&Playlist> {
         self.playlists.selected().and_then(|i| self.config.playlists.get(i))
     }
 
+    /// The playlist was listed when its URL was entered. A blank `dir` takes its title, now if the listing is in,
+    /// otherwise when `Msg::Remote` arrives.
     fn add(&mut self, url: String, dir: String) {
-        if self.config.playlists.iter().any(|p| p.url == url) {
-            return self.push_log(format!("already added: {url}"));
+        let mut p = Playlist { url, dir };
+        if let Some(Ok(r)) = self.remotes.get(&p.url) {
+            p.dir = library::dir_name(&p, r);
         }
-        self.config.playlists.push(Playlist { url: url.clone(), dir });
+        self.config.playlists.push(p);
         self.playlists.select(Some(self.config.playlists.len() - 1));
         self.save();
-        self.fetch(url);
     }
 
     fn refresh(&mut self) {
@@ -224,6 +338,10 @@ impl App {
     }
 
     fn push_log(&mut self, line: String) {
+        // Scrolled up, the view stays on the same lines.
+        if self.log_scroll > 0 {
+            self.log_scroll += 1;
+        }
         self.log.push(line);
         if self.log.len() > 1000 {
             self.log.drain(..500);
@@ -244,14 +362,23 @@ impl App {
             Err(e) => return Some(Err(e)),
         };
         let dir = self.root.join(library::dir_name(p, remote));
-        Some(Ok(library::plan(remote, self.files.as_ref()?, &dir, &self.config.unavailable)))
+        let shared: Vec<&Remote> = (self.config.playlists.iter())
+            .filter(|o| o.url != p.url)
+            .filter_map(|o| match self.remotes.get(&o.url) {
+                Some(Ok(r)) if self.root.join(library::dir_name(o, r)) == dir => Some(r),
+                _ => None,
+            })
+            .collect();
+        Some(Ok(library::plan(remote, &shared, self.files.as_ref()?, &dir, &self.config.unavailable)))
     }
 
     fn draw(&mut self, f: &mut Frame) {
         let [main, log, footer] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(10), Constraint::Length(1)]).areas(f.area());
         let [left, right] = Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)]).areas(main);
-        let border = |focused: bool| Style::new().fg(if focused { Color::Cyan } else { Color::DarkGray });
+        self.areas = [left, right, log];
+        let focus = self.focus;
+        let border = |pane: Pane| Style::new().fg(if pane == focus { Color::Cyan } else { Color::DarkGray });
 
         let items: Vec<Line> = (self.config.playlists.iter())
             .map(|p| {
@@ -266,7 +393,7 @@ impl App {
             .collect();
         let list = List::new(items)
             .highlight_style(Style::new().reversed())
-            .block(Block::bordered().title(" playlists ").border_style(border(!self.focus_tracks)));
+            .block(Block::bordered().title(" playlists ").border_style(border(Pane::Playlists)));
         f.render_stateful_widget(list, left, &mut self.playlists);
 
         let (title, body) = match self.selected() {
@@ -282,7 +409,7 @@ impl App {
                 },
             ),
         };
-        let block = Block::bordered().title(title).border_style(border(self.focus_tracks));
+        let block = Block::bordered().title(title).border_style(border(Pane::Tracks));
         match body {
             Ok(items) => f.render_stateful_widget(
                 List::new(items).highlight_style(Style::new().reversed()).block(block),
@@ -293,16 +420,43 @@ impl App {
         }
 
         let height = log.height.saturating_sub(2) as usize;
+        self.log_scroll = self.log_scroll.min(self.log.len().saturating_sub(height));
+        let end = self.log.len() - self.log_scroll;
         let lines: Vec<Line> =
-            self.log[self.log.len().saturating_sub(height)..].iter().map(|l| Line::from(l.as_str())).collect();
-        let title = if self.busy { " log · syncing… " } else { " log " };
-        f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), log);
+            self.log[end.saturating_sub(height)..end].iter().map(|l| Line::from(l.as_str())).collect();
+        let mut title = String::from(" log ");
+        if self.busy {
+            title += "· syncing… ";
+        }
+        if self.log_scroll > 0 {
+            title += &format!("· {} newer, End to follow ", self.log_scroll);
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(title).border_style(border(Pane::Log))),
+            log,
+        );
 
         let help = match &self.input {
             Input::Url(buf) => format!("playlist URL: {buf}▏"),
-            Input::Dir { buf, .. } => format!("folder in {} (blank = playlist title): {buf}▏", self.root.display()),
+            Input::Dir { url, buf, menu, pick } => {
+                if !menu.is_empty() {
+                    let height = (menu.len() as u16 + 2).min(main.height + log.height);
+                    let area = Rect { y: footer.y - height, height, ..footer };
+                    let items = List::new(menu.iter().map(String::as_str))
+                        .highlight_style(Style::new().reversed())
+                        .block(Block::bordered().title(" folders · tab next · shift+tab back "));
+                    f.render_widget(Clear, area);
+                    f.render_stateful_widget(items, area, &mut ListState::default().with_selected(*pick));
+                }
+                let title = match self.remotes.get(url) {
+                    Some(Ok(r)) => library::dir_name(&Playlist { url: url.clone(), dir: String::new() }, r),
+                    Some(Err(_)) => "playlist title".into(),
+                    None => "playlist title, loading…".into(),
+                };
+                format!("folder in library (blank = {title}, tab completes): {buf}▏")
+            }
             Input::None => format!(
-                "a add · r refresh · s sync · S sync all · x remove · tab switch panel · q quit    {}",
+                "a add · r refresh · s sync · S sync all · x remove · tab/click focus · ↑↓ pgup pgdn scroll · q quit    {}",
                 self.root.display()
             ),
         };
@@ -318,6 +472,18 @@ fn edit(buf: &mut String, code: KeyCode) {
         }
         _ => {}
     }
+}
+
+/// The longest start all `items` share, ignoring case, as spelled in the first.
+fn common_prefix(items: &[String]) -> &str {
+    let Some(first) = items.first() else { return "" };
+    let same = |s: &String| {
+        (first.char_indices().zip(s.chars()))
+            .take_while(|((_, a), b)| a.to_lowercase().eq(b.to_lowercase()))
+            .last()
+            .map_or(0, |((i, a), _)| i + a.len_utf8())
+    };
+    &first[..items.iter().map(same).min().unwrap_or(0)]
 }
 
 fn label(status: &Status) -> Span<'static> {
@@ -389,6 +555,77 @@ mod tests {
         assert!(Config::load(&root).unwrap().playlists.is_empty());
         assert!(!app.key(KeyCode::Char('q')));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn completes_folders() {
+        let root = env::temp_dir().join(format!("trackman-test-{}-complete", process::id()));
+        for d in ["warmup", "Workout", "sets/2026", ".hidden"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let mut app = App::new(root.clone(), Config::default());
+        let dir = |app: &App| match &app.input {
+            Input::Dir { buf, menu, .. } => (buf.clone(), menu.len()),
+            _ => panic!("left the folder prompt"),
+        };
+        // Set directly: entering a URL would start a real scdl listing.
+        app.input = Input::Dir { url: "u".into(), buf: String::new(), menu: Vec::new(), pick: None };
+
+        press(&mut app, "w");
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("w".into(), 2));
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("warmup/".into(), 2));
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("Workout/".into(), 2));
+        app.key(KeyCode::BackTab);
+        assert_eq!(dir(&app), ("warmup/".into(), 2));
+        // Typing closes the menu; `/` after a completed folder adds nothing.
+        press(&mut app, "/");
+        assert_eq!(dir(&app), ("warmup/".into(), 0));
+
+        for _ in 0..7 {
+            app.key(KeyCode::Backspace);
+        }
+        press(&mut app, "s");
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("sets/".into(), 0));
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("sets/2026/".into(), 0));
+
+        // Esc closes an open menu first, then the prompt.
+        app.input = Input::Dir { url: "u".into(), buf: String::new(), menu: vec!["a/".into()], pick: None };
+        app.key(KeyCode::Esc);
+        assert_eq!(dir(&app), (String::new(), 0));
+        app.key(KeyCode::Esc);
+        assert!(matches!(app.input, Input::None));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn scrolls_and_draws() {
+        let mut app = App::new(env::temp_dir(), Config::default());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        for i in 0..50 {
+            app.push_log(format!("line {i}"));
+        }
+        app.key(KeyCode::Tab);
+        app.key(KeyCode::Tab);
+        assert!(app.focus == Pane::Log);
+        app.key(KeyCode::Up);
+        app.push_log("line 50".into());
+        assert_eq!(app.log_scroll, 2);
+        // Scrolling past the top stops at the oldest line.
+        app.key(KeyCode::Home);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.log_scroll, 51 - 8);
+        app.key(KeyCode::End);
+        assert_eq!(app.log_scroll, 0);
+        app.key(KeyCode::BackTab);
+        assert!(app.focus == Pane::Tracks);
+
+        app.input = Input::Dir { url: "u".into(), buf: "w".into(), menu: vec!["warmup/".into()], pick: Some(0) };
+        terminal.draw(|f| app.draw(f)).unwrap();
     }
 
     #[test]
