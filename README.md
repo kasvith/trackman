@@ -71,7 +71,7 @@ The folder is the library root; it's created if it doesn't exist, and defaults t
 
 | Key | Action |
 | --- | --- |
-| `a` | Add a playlist: paste the URL, then a folder name (leave it blank to use the playlist title) |
+| `a` | Add a playlist: paste the URL, then a folder name. Leave it blank to use the playlist title, or press `Tab` to complete an existing folder (`Tab` again cycles, `Shift+Tab` goes back) |
 | `s` | Sync the selected playlist |
 | `S` | Sync all playlists |
 | `r` | Refresh: rescan the library and fetch the playlists again |

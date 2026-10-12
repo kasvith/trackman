@@ -31,7 +31,7 @@ Two files. `src/library.rs` holds everything that touches disk or external proce
 4. Parses scdl's stderr for DRM errors and sends each id as `Msg::Drm`. `App` then saves those ids to `unavailable` in the config.
 5. Sends each linked or saved file as `Msg::File` as it lands, so rows update before the end-of-sync rescan. Adds them to the index and writes it if anything changed.
 
-**Config.** `trackman.toml` lives at the library root. A playlist added with a blank `dir` gets its folder from the SoundCloud title (`dir_name`) when the first `Msg::Remote` arrives.
+**Config.** `trackman.toml` lives at the library root. Entering a playlist URL starts its listing, so the folder prompt can show the title as the default. A blank `dir` takes the title (`dir_name`) when the playlist is added, or when the first `Msg::Remote` arrives if the listing is still loading.
 
 **Index.** `trackman-index.toml`, also at the root, maps file paths (relative, `/`-separated) to track ids, because `NAME_FORMAT` leaves the id out. Only `sync` writes it, on the worker thread. `App` never holds it. An existing entry is never overwritten by a download: a different id for the same path is a filename clash and gets logged.
 
@@ -43,7 +43,7 @@ Two files. `src/library.rs` holds everything that touches disk or external proce
 
 ## Tests
 
-Tests don't need scdl or ffprobe. When ffprobe is missing, `url_tag` returns `None`. Filesystem tests use per-test folders under `std::env::temp_dir()` (there's no tempfile crate). UI logic is tested without a terminal through `App::new(root, config)` and `app.key(KeyCode::…)`. Avoid tests that add a *new* playlist URL, because `App::add` starts a real `scdl` fetch thread. `draw` runs against ratatui's `TestBackend`.
+Tests don't need scdl or ffprobe. When ffprobe is missing, `url_tag` returns `None`. Filesystem tests use per-test folders under `std::env::temp_dir()` (there's no tempfile crate). UI logic is tested without a terminal through `App::new(root, config)` and `app.key(KeyCode::…)`. Avoid tests that enter a *new* playlist URL, because that starts a real `scdl` fetch thread. To test the folder prompt, set `app.input = Input::Dir { … }` directly. `draw` runs against ratatui's `TestBackend`.
 
 ## Releases
 

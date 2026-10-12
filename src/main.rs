@@ -9,7 +9,7 @@ use ratatui::crossterm::execute;
 use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, List, ListState, Paragraph};
+use ratatui::widgets::{Block, Clear, List, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
 use std::io::stdout;
@@ -21,7 +21,13 @@ use std::{env, fs, process, thread};
 enum Input {
     None,
     Url(String),
-    Dir { url: String, buf: String },
+    /// `menu` holds folder completions after Tab, and `pick` the one Tab cycled to.
+    Dir {
+        url: String,
+        buf: String,
+        menu: Vec<String>,
+        pick: Option<usize>,
+    },
 }
 
 #[derive(Clone, Copy, PartialEq)]
@@ -153,7 +159,13 @@ impl App {
                 KeyCode::Enter if !buf.trim().is_empty() => {
                     // Share links carry tracking params; the secret s-… token is in the path, so keep that.
                     let url = buf.trim().split('?').next().unwrap_or_default().to_string();
-                    self.input = Input::Dir { url, buf: String::new() };
+                    if self.config.playlists.iter().any(|p| p.url == url) {
+                        self.push_log(format!("already added: {url}"));
+                    } else {
+                        // Listed now, so the folder prompt can show the playlist title as its default.
+                        self.fetch(url.clone());
+                        self.input = Input::Dir { url, buf: String::new(), menu: Vec::new(), pick: None };
+                    }
                 }
                 KeyCode::Esc => {}
                 code => {
@@ -161,12 +173,39 @@ impl App {
                     self.input = Input::Url(buf);
                 }
             },
-            Input::Dir { url, mut buf } => match code {
+            Input::Dir { url, mut buf, mut menu, mut pick } => match code {
                 KeyCode::Enter => self.add(url, buf.trim().trim_matches('/').to_string()),
-                KeyCode::Esc => {}
+                KeyCode::Esc if menu.is_empty() => {}
+                // zsh style: the first Tab fills in what all matches share, the next ones cycle through them.
+                KeyCode::Tab | KeyCode::BackTab => {
+                    if menu.is_empty() {
+                        menu = library::complete_dir(&self.root, &buf);
+                        let shared = common_prefix(&menu);
+                        if shared.len() > buf.len() {
+                            buf = shared.to_string();
+                        }
+                        if menu.len() == 1 {
+                            menu.clear();
+                        }
+                    } else {
+                        let (n, back) = (menu.len(), code == KeyCode::BackTab);
+                        let i = match pick {
+                            None if back => n - 1,
+                            None => 0,
+                            Some(i) if back => (i + n - 1) % n,
+                            Some(i) => (i + 1) % n,
+                        };
+                        pick = Some(i);
+                        buf = menu[i].clone();
+                    }
+                    self.input = Input::Dir { url, buf, menu, pick };
+                }
                 code => {
-                    edit(&mut buf, code);
-                    self.input = Input::Dir { url, buf };
+                    // A completed folder ends in `/`, so typing `/` next to it just goes into that folder.
+                    if !(code == KeyCode::Char('/') && buf.ends_with('/')) {
+                        edit(&mut buf, code);
+                    }
+                    self.input = Input::Dir { url, buf, menu: Vec::new(), pick: None };
                 }
             },
             Input::None => match code {
@@ -255,14 +294,16 @@ impl App {
         self.playlists.selected().and_then(|i| self.config.playlists.get(i))
     }
 
+    /// The playlist was listed when its URL was entered. A blank `dir` takes its title, now if the listing is in,
+    /// otherwise when `Msg::Remote` arrives.
     fn add(&mut self, url: String, dir: String) {
-        if self.config.playlists.iter().any(|p| p.url == url) {
-            return self.push_log(format!("already added: {url}"));
+        let mut p = Playlist { url, dir };
+        if let Some(Ok(r)) = self.remotes.get(&p.url) {
+            p.dir = library::dir_name(&p, r);
         }
-        self.config.playlists.push(Playlist { url: url.clone(), dir });
+        self.config.playlists.push(p);
         self.playlists.select(Some(self.config.playlists.len() - 1));
         self.save();
-        self.fetch(url);
     }
 
     fn refresh(&mut self) {
@@ -397,7 +438,23 @@ impl App {
 
         let help = match &self.input {
             Input::Url(buf) => format!("playlist URL: {buf}▏"),
-            Input::Dir { buf, .. } => format!("folder in {} (blank = playlist title): {buf}▏", self.root.display()),
+            Input::Dir { url, buf, menu, pick } => {
+                if !menu.is_empty() {
+                    let height = (menu.len() as u16 + 2).min(main.height + log.height);
+                    let area = Rect { y: footer.y - height, height, ..footer };
+                    let items = List::new(menu.iter().map(String::as_str))
+                        .highlight_style(Style::new().reversed())
+                        .block(Block::bordered().title(" folders · tab next · shift+tab back "));
+                    f.render_widget(Clear, area);
+                    f.render_stateful_widget(items, area, &mut ListState::default().with_selected(*pick));
+                }
+                let title = match self.remotes.get(url) {
+                    Some(Ok(r)) => library::dir_name(&Playlist { url: url.clone(), dir: String::new() }, r),
+                    Some(Err(_)) => "playlist title".into(),
+                    None => "playlist title, loading…".into(),
+                };
+                format!("folder in library (blank = {title}, tab completes): {buf}▏")
+            }
             Input::None => format!(
                 "a add · r refresh · s sync · S sync all · x remove · tab/click focus · ↑↓ pgup pgdn scroll · q quit    {}",
                 self.root.display()
@@ -415,6 +472,18 @@ fn edit(buf: &mut String, code: KeyCode) {
         }
         _ => {}
     }
+}
+
+/// The longest start all `items` share, ignoring case, as spelled in the first.
+fn common_prefix(items: &[String]) -> &str {
+    let Some(first) = items.first() else { return "" };
+    let same = |s: &String| {
+        (first.char_indices().zip(s.chars()))
+            .take_while(|((_, a), b)| a.to_lowercase().eq(b.to_lowercase()))
+            .last()
+            .map_or(0, |((i, a), _)| i + a.len_utf8())
+    };
+    &first[..items.iter().map(same).min().unwrap_or(0)]
 }
 
 fn label(status: &Status) -> Span<'static> {
@@ -489,6 +558,51 @@ mod tests {
     }
 
     #[test]
+    fn completes_folders() {
+        let root = env::temp_dir().join(format!("trackman-test-{}-complete", process::id()));
+        for d in ["warmup", "Workout", "sets/2026", ".hidden"] {
+            fs::create_dir_all(root.join(d)).unwrap();
+        }
+        let mut app = App::new(root.clone(), Config::default());
+        let dir = |app: &App| match &app.input {
+            Input::Dir { buf, menu, .. } => (buf.clone(), menu.len()),
+            _ => panic!("left the folder prompt"),
+        };
+        // Set directly: entering a URL would start a real scdl listing.
+        app.input = Input::Dir { url: "u".into(), buf: String::new(), menu: Vec::new(), pick: None };
+
+        press(&mut app, "w");
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("w".into(), 2));
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("warmup/".into(), 2));
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("Workout/".into(), 2));
+        app.key(KeyCode::BackTab);
+        assert_eq!(dir(&app), ("warmup/".into(), 2));
+        // Typing closes the menu; `/` after a completed folder adds nothing.
+        press(&mut app, "/");
+        assert_eq!(dir(&app), ("warmup/".into(), 0));
+
+        for _ in 0..7 {
+            app.key(KeyCode::Backspace);
+        }
+        press(&mut app, "s");
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("sets/".into(), 0));
+        app.key(KeyCode::Tab);
+        assert_eq!(dir(&app), ("sets/2026/".into(), 0));
+
+        // Esc closes an open menu first, then the prompt.
+        app.input = Input::Dir { url: "u".into(), buf: String::new(), menu: vec!["a/".into()], pick: None };
+        app.key(KeyCode::Esc);
+        assert_eq!(dir(&app), (String::new(), 0));
+        app.key(KeyCode::Esc);
+        assert!(matches!(app.input, Input::None));
+        fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
     fn scrolls_and_draws() {
         let mut app = App::new(env::temp_dir(), Config::default());
         let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
@@ -509,6 +623,8 @@ mod tests {
         assert_eq!(app.log_scroll, 0);
         app.key(KeyCode::BackTab);
         assert!(app.focus == Pane::Tracks);
+
+        app.input = Input::Dir { url: "u".into(), buf: "w".into(), menu: vec!["warmup/".into()], pick: Some(0) };
         terminal.draw(|f| app.draw(f)).unwrap();
     }
 

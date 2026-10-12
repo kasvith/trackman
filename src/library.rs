@@ -167,6 +167,21 @@ fn index_key(root: &Path, path: &Path) -> String {
     rel.components().map(|c| c.as_os_str().to_string_lossy()).collect::<Vec<_>>().join("/")
 }
 
+/// Folders under the root that complete `typed`, ignoring case: `sets/w` -> `["sets/warmup/", "sets/Winter/"]`.
+pub fn complete_dir(root: &Path, typed: &str) -> Vec<String> {
+    let (parent, prefix) = typed.split_at(typed.rfind('/').map_or(0, |i| i + 1));
+    let Ok(entries) = fs::read_dir(root.join(parent.trim_start_matches('/'))) else { return Vec::new() };
+    let prefix = prefix.to_lowercase();
+    let mut dirs: Vec<String> = (entries.flatten())
+        .filter(|e| e.path().is_dir())
+        .filter_map(|e| e.file_name().into_string().ok())
+        .filter(|name| !name.starts_with('.') && name.to_lowercase().starts_with(&prefix))
+        .map(|name| format!("{parent}{name}/"))
+        .collect();
+    dirs.sort_by_key(|d| d.to_lowercase());
+    dirs
+}
+
 fn id_from_name(path: &Path) -> Option<String> {
     let stem = path.file_stem()?.to_str()?;
     let id = stem.strip_suffix(']')?.rsplit_once('[')?.1;
@@ -484,6 +499,12 @@ mod tests {
         let mut ids: Vec<_> = scan(&root).into_iter().map(|f| f.id.unwrap_or_default()).collect();
         ids.sort();
         assert_eq!(ids, ["", "1", "2", "5", "6", "7"]);
+
+        fs::create_dir_all(root.join("P2")).unwrap();
+        assert_eq!(complete_dir(&root, ""), ["p/", "P2/"]);
+        assert_eq!(complete_dir(&root, "p"), ["p/", "P2/"]);
+        assert_eq!(complete_dir(&root, "p/N"), ["p/nested/"]);
+        assert!(complete_dir(&root, "missing/").is_empty());
         fs::remove_dir_all(&root).unwrap();
     }
 }
