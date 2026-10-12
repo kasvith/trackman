@@ -22,7 +22,7 @@ Two files. `src/library.rs` holds everything that touches disk or external proce
 
 **Threading.** Slow work runs on spawned threads that report back through an `mpsc` channel of `library::Msg`. `App::run` drains the channel, redraws, and polls keys every 200ms. On refresh, each playlist gets its own `fetch` thread and the library scan gets one more. `sync_all` runs playlists one after another on a single worker thread; `App.busy` guards against starting a second sync.
 
-**Planning is pure.** `plan(remote, files, dir, unavailable)` turns a playlist's remote tracks and the scanned local files into `Row`s with one of five statuses: `Have`, `Link`, `New`, `Drm`, `Extra`. The UI recomputes rows every frame, and `sync` uses the same function, so status logic lives only there. A local file matches a track by id, looked up in the index or, for files from older versions, taken from `[id]` at the end of the filename. Files with no known id match by the `WWWAUDIOFILE` URL tag read with `ffprobe`.
+**Planning is pure.** `plan(remote, shared, files, dir, unavailable)` turns a playlist's remote tracks and the scanned local files into `Row`s with one of five statuses: `Have`, `Link`, `New`, `Drm`, `Extra`. The UI recomputes rows every frame, and `sync` uses the same function, so status logic lives only there. Several playlists can share a folder: `shared` holds the others' remotes, so their files aren't `Extra`. A local file matches a track by id, looked up in the index or, for files from older versions, taken from `[id]` at the end of the filename. Files with no known id match by the `WWWAUDIOFILE` URL tag read with `ffprobe`.
 
 **Sync flow.** For each playlist, `sync`:
 1. Hardlinks `Link` rows, copying instead when the folders are on different drives.

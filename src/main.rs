@@ -244,7 +244,14 @@ impl App {
             Err(e) => return Some(Err(e)),
         };
         let dir = self.root.join(library::dir_name(p, remote));
-        Some(Ok(library::plan(remote, self.files.as_ref()?, &dir, &self.config.unavailable)))
+        let shared: Vec<&Remote> = (self.config.playlists.iter())
+            .filter(|o| o.url != p.url)
+            .filter_map(|o| match self.remotes.get(&o.url) {
+                Some(Ok(r)) if self.root.join(library::dir_name(o, r)) == dir => Some(r),
+                _ => None,
+            })
+            .collect();
+        Some(Ok(library::plan(remote, &shared, self.files.as_ref()?, &dir, &self.config.unavailable)))
     }
 
     fn draw(&mut self, f: &mut Frame) {

@@ -182,7 +182,8 @@ fn url_tag(path: &Path) -> Option<String> {
 }
 
 /// One row per remote track, in playlist order, then local files in `dir` the playlist no longer has.
-pub fn plan(remote: &Remote, files: &[LocalFile], dir: &Path, unavailable: &[String]) -> Vec<Row> {
+/// `shared` are other playlists synced into the same `dir`; their files aren't `Extra`.
+pub fn plan(remote: &Remote, shared: &[&Remote], files: &[LocalFile], dir: &Path, unavailable: &[String]) -> Vec<Row> {
     let matches = |t: &Track, f: &LocalFile| f.id.as_ref() == Some(&t.id) || f.url.as_ref() == Some(&t.url);
     let in_dir = |f: &LocalFile| f.path.parent() == Some(dir);
     let file_name = |f: &LocalFile| f.path.file_name().unwrap_or_default().to_string_lossy().into_owned();
@@ -204,7 +205,10 @@ pub fn plan(remote: &Remote, files: &[LocalFile], dir: &Path, unavailable: &[Str
     rows.extend(
         files
             .iter()
-            .filter(|f| in_dir(f) && !remote.tracks.iter().any(|t| matches(t, f)))
+            .filter(|f| in_dir(f))
+            .filter(|f| {
+                !std::iter::once(remote).chain(shared.iter().copied()).any(|r| r.tracks.iter().any(|t| matches(t, f)))
+            })
             .map(|f| Row { status: Status::Extra, name: file_name(f) }),
     );
     rows
@@ -231,7 +235,8 @@ fn sync(root: &Path, p: &Playlist, unavailable: &mut Vec<String>, tx: &Sender<Ms
     // Loaded before anything changes on disk, so an unreadable index stops the sync instead of being overwritten.
     let mut index: Index = load(root, INDEX)?;
     let before = index.clone();
-    let rows = plan(&remote, &scan(root), &dir, unavailable);
+    // No `shared`: sync never acts on `Extra` rows.
+    let rows = plan(&remote, &[], &scan(root), &dir, unavailable);
     fs::create_dir_all(&dir).map_err(|e| format!("{}: {e}", dir.display()))?;
 
     // Rows start with one per track, in playlist order, so zip pairs each Link row with its track.
@@ -382,7 +387,12 @@ mod tests {
             file("/r/other/B [3].m4a", Some("3"), None),
             file("/r/p/Gone [9].m4a", Some("9"), None),
         ];
-        let rows = plan(&remote, &files, Path::new("/r/p"), &["4".into()]);
+        // Track 9 left this playlist but is in another one synced into the same folder, so it isn't extra.
+        let other = Remote { title: "y".into(), tracks: vec![track("9")] };
+        assert!(
+            plan(&remote, &[&other], &files, Path::new("/r/p"), &[]).iter().all(|r| !matches!(r.status, Status::Extra))
+        );
+        let rows = plan(&remote, &[], &files, Path::new("/r/p"), &["4".into()]);
         let got: Vec<_> = (rows.iter())
             .map(|r| match r.status {
                 Status::Have => "have",

@@ -88,7 +88,7 @@ Each track's status:
 | `link` | Saved in another folder; syncing hardlinks it here |
 | `new` | Syncing downloads it |
 | `drm` | DRM protected; skipped |
-| `extra` | In the folder but no longer in the playlist; left alone |
+| `extra` | In the folder but in none of the playlists synced into it; left alone |
 
 ## Library layout
 
