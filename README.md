@@ -76,8 +76,9 @@ The folder is the library root; it's created if it doesn't exist, and defaults t
 | `S` | Sync all playlists |
 | `r` | Refresh: rescan the library and fetch the playlists again |
 | `x` | Remove the selected playlist from the config (files stay) |
-| `Tab` | Switch between the playlist and track panels |
-| `j` / `k`, `↓` / `↑` | Move the selection |
+| `Tab` / `Shift+Tab` | Switch between the playlist, track and log panels (or click one) |
+| `j` / `k`, `↓` / `↑` | Move the selection, or scroll the log (the mouse wheel scrolls the panel under it) |
+| `PgUp` / `PgDn`, `g` / `G` | Move a page, or to the top / bottom (`G` makes the log follow new lines again) |
 | `q` | Quit (while a sync is running, `Q` quits anyway) |
 
 Each track's status:

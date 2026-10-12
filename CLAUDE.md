@@ -43,7 +43,7 @@ Two files. `src/library.rs` holds everything that touches disk or external proce
 
 ## Tests
 
-Tests don't need scdl or ffprobe. When ffprobe is missing, `url_tag` returns `None`. Filesystem tests use per-test folders under `std::env::temp_dir()` (there's no tempfile crate). UI logic is tested without a terminal through `App::new(root, config)` and `app.key(KeyCode::…)`. Avoid tests that add a *new* playlist URL, because `App::add` starts a real `scdl` fetch thread.
+Tests don't need scdl or ffprobe. When ffprobe is missing, `url_tag` returns `None`. Filesystem tests use per-test folders under `std::env::temp_dir()` (there's no tempfile crate). UI logic is tested without a terminal through `App::new(root, config)` and `app.key(KeyCode::…)`. Avoid tests that add a *new* playlist URL, because `App::add` starts a real `scdl` fetch thread. `draw` runs against ratatui's `TestBackend`.
 
 ## Releases
 

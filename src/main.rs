@@ -1,13 +1,18 @@
 mod library;
 
 use library::{Config, LocalFile, Msg, Playlist, Remote, Row, Status};
-use ratatui::crossterm::event::{self, Event, KeyCode, KeyEventKind};
-use ratatui::layout::{Constraint, Layout};
+use ratatui::crossterm::event::{
+    self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind, MouseButton, MouseEvent,
+    MouseEventKind,
+};
+use ratatui::crossterm::execute;
+use ratatui::layout::{Constraint, Layout, Position, Rect};
 use ratatui::style::{Color, Style, Stylize};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, List, ListState, Paragraph};
 use ratatui::{DefaultTerminal, Frame};
 use std::collections::HashMap;
+use std::io::stdout;
 use std::path::PathBuf;
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::time::Duration;
@@ -18,6 +23,15 @@ enum Input {
     Url(String),
     Dir { url: String, buf: String },
 }
+
+#[derive(Clone, Copy, PartialEq)]
+enum Pane {
+    Playlists,
+    Tracks,
+    Log,
+}
+
+const PANES: [Pane; 3] = [Pane::Playlists, Pane::Tracks, Pane::Log];
 
 struct App {
     root: PathBuf,
@@ -31,7 +45,11 @@ struct App {
     input: Input,
     playlists: ListState,
     tracks: ListState,
-    focus_tracks: bool,
+    focus: Pane,
+    /// Lines scrolled up from the newest; 0 follows new output.
+    log_scroll: usize,
+    /// Where each pane was last drawn, indexed by `Pane`, for the mouse and page keys.
+    areas: [Rect; 3],
     tx: Sender<Msg>,
     rx: Receiver<Msg>,
 }
@@ -44,7 +62,11 @@ fn main() {
     let config = Config::load(&root).unwrap_or_else(|e| die(&e));
     let mut app = App::new(root, config);
     app.refresh();
-    let result = app.run(ratatui::init());
+    let terminal = ratatui::init();
+    // ponytail: mouse capture stops plain drag-to-select; most terminals still select with Shift or Option held
+    execute!(stdout(), EnableMouseCapture).ok();
+    let result = app.run(terminal);
+    execute!(stdout(), DisableMouseCapture).ok();
     ratatui::restore();
     if let Err(e) = result {
         die(&e.to_string());
@@ -69,7 +91,9 @@ impl App {
             input: Input::None,
             playlists: ListState::default().with_selected(Some(0)),
             tracks: ListState::default(),
-            focus_tracks: false,
+            focus: Pane::Playlists,
+            log_scroll: 0,
+            areas: [Rect::default(); 3],
             tx,
             rx,
         }
@@ -81,12 +105,13 @@ impl App {
                 self.handle(msg);
             }
             terminal.draw(|f| self.draw(f))?;
-            if event::poll(Duration::from_millis(200))?
-                && let Event::Key(key) = event::read()?
-                && key.kind == KeyEventKind::Press
-                && !self.key(key.code)
-            {
-                return Ok(());
+            if !event::poll(Duration::from_millis(200))? {
+                continue;
+            }
+            match event::read()? {
+                Event::Key(key) if key.kind == KeyEventKind::Press && !self.key(key.code) => return Ok(()),
+                Event::Mouse(m) => self.mouse(m),
+                _ => {}
             }
         }
     }
@@ -163,25 +188,67 @@ impl App {
                         self.push_log(format!("removed {} (files kept)", p.url));
                     }
                 }
-                KeyCode::Tab => self.focus_tracks = !self.focus_tracks,
-                KeyCode::Down | KeyCode::Char('j') => self.step(true),
-                KeyCode::Up | KeyCode::Char('k') => self.step(false),
+                KeyCode::Tab => self.focus = PANES[(self.focus as usize + 1) % 3],
+                KeyCode::BackTab => self.focus = PANES[(self.focus as usize + 2) % 3],
+                KeyCode::Down | KeyCode::Char('j') => self.scroll(self.focus, true, 1),
+                KeyCode::Up | KeyCode::Char('k') => self.scroll(self.focus, false, 1),
+                KeyCode::PageDown => self.scroll(self.focus, true, self.page()),
+                KeyCode::PageUp => self.scroll(self.focus, false, self.page()),
+                KeyCode::End | KeyCode::Char('G') => self.scroll(self.focus, true, u16::MAX),
+                KeyCode::Home | KeyCode::Char('g') => self.scroll(self.focus, false, u16::MAX),
                 _ => {}
             },
         }
         true
     }
 
-    fn step(&mut self, down: bool) {
-        let list = if self.focus_tracks { &mut self.tracks } else { &mut self.playlists };
-        if down {
-            list.select_next()
-        } else {
-            list.select_previous()
+    /// Clicking focuses a pane and picks the row under the pointer; the wheel scrolls the pane under it.
+    fn mouse(&mut self, m: MouseEvent) {
+        let pos = Position::new(m.column, m.row);
+        let Some(pane) = PANES.into_iter().find(|&p| self.areas[p as usize].contains(pos)) else { return };
+        let area = self.areas[pane as usize];
+        match m.kind {
+            MouseEventKind::ScrollDown => self.scroll(pane, true, 3),
+            MouseEventKind::ScrollUp => self.scroll(pane, false, 3),
+            MouseEventKind::Down(MouseButton::Left) => {
+                self.focus = pane;
+                // Inside the border only.
+                if m.row > area.y
+                    && m.row + 1 < area.bottom()
+                    && let Some(list) = self.list(pane)
+                {
+                    list.select(Some(list.offset() + (m.row - area.y - 1) as usize));
+                }
+            }
+            _ => {}
         }
-        if !self.focus_tracks {
-            self.tracks = ListState::default();
+    }
+
+    /// The list shown in `pane`. Moving through playlists starts the track list over from the top.
+    fn list(&mut self, pane: Pane) -> Option<&mut ListState> {
+        match pane {
+            Pane::Playlists => {
+                self.tracks = ListState::default();
+                Some(&mut self.playlists)
+            }
+            Pane::Tracks => Some(&mut self.tracks),
+            Pane::Log => None,
         }
+    }
+
+    /// Moves `n` rows. Lists clamp to their last row when drawn, the log in `draw`.
+    fn scroll(&mut self, pane: Pane, down: bool, n: u16) {
+        match self.list(pane) {
+            Some(list) if down => list.scroll_down_by(n),
+            Some(list) => list.scroll_up_by(n),
+            None if down => self.log_scroll = self.log_scroll.saturating_sub(n.into()),
+            None => self.log_scroll = self.log_scroll.saturating_add(n.into()),
+        }
+    }
+
+    /// Rows inside the focused pane's border.
+    fn page(&self) -> u16 {
+        self.areas[self.focus as usize].height.saturating_sub(2).max(1)
     }
 
     fn selected(&self) -> Option<&Playlist> {
@@ -230,6 +297,10 @@ impl App {
     }
 
     fn push_log(&mut self, line: String) {
+        // Scrolled up, the view stays on the same lines.
+        if self.log_scroll > 0 {
+            self.log_scroll += 1;
+        }
         self.log.push(line);
         if self.log.len() > 1000 {
             self.log.drain(..500);
@@ -264,7 +335,9 @@ impl App {
         let [main, log, footer] =
             Layout::vertical([Constraint::Fill(1), Constraint::Length(10), Constraint::Length(1)]).areas(f.area());
         let [left, right] = Layout::horizontal([Constraint::Percentage(35), Constraint::Fill(1)]).areas(main);
-        let border = |focused: bool| Style::new().fg(if focused { Color::Cyan } else { Color::DarkGray });
+        self.areas = [left, right, log];
+        let focus = self.focus;
+        let border = |pane: Pane| Style::new().fg(if pane == focus { Color::Cyan } else { Color::DarkGray });
 
         let items: Vec<Line> = (self.config.playlists.iter())
             .map(|p| {
@@ -279,7 +352,7 @@ impl App {
             .collect();
         let list = List::new(items)
             .highlight_style(Style::new().reversed())
-            .block(Block::bordered().title(" playlists ").border_style(border(!self.focus_tracks)));
+            .block(Block::bordered().title(" playlists ").border_style(border(Pane::Playlists)));
         f.render_stateful_widget(list, left, &mut self.playlists);
 
         let (title, body) = match self.selected() {
@@ -295,7 +368,7 @@ impl App {
                 },
             ),
         };
-        let block = Block::bordered().title(title).border_style(border(self.focus_tracks));
+        let block = Block::bordered().title(title).border_style(border(Pane::Tracks));
         match body {
             Ok(items) => f.render_stateful_widget(
                 List::new(items).highlight_style(Style::new().reversed()).block(block),
@@ -306,16 +379,27 @@ impl App {
         }
 
         let height = log.height.saturating_sub(2) as usize;
+        self.log_scroll = self.log_scroll.min(self.log.len().saturating_sub(height));
+        let end = self.log.len() - self.log_scroll;
         let lines: Vec<Line> =
-            self.log[self.log.len().saturating_sub(height)..].iter().map(|l| Line::from(l.as_str())).collect();
-        let title = if self.busy { " log · syncing… " } else { " log " };
-        f.render_widget(Paragraph::new(lines).block(Block::bordered().title(title)), log);
+            self.log[end.saturating_sub(height)..end].iter().map(|l| Line::from(l.as_str())).collect();
+        let mut title = String::from(" log ");
+        if self.busy {
+            title += "· syncing… ";
+        }
+        if self.log_scroll > 0 {
+            title += &format!("· {} newer, End to follow ", self.log_scroll);
+        }
+        f.render_widget(
+            Paragraph::new(lines).block(Block::bordered().title(title).border_style(border(Pane::Log))),
+            log,
+        );
 
         let help = match &self.input {
             Input::Url(buf) => format!("playlist URL: {buf}▏"),
             Input::Dir { buf, .. } => format!("folder in {} (blank = playlist title): {buf}▏", self.root.display()),
             Input::None => format!(
-                "a add · r refresh · s sync · S sync all · x remove · tab switch panel · q quit    {}",
+                "a add · r refresh · s sync · S sync all · x remove · tab/click focus · ↑↓ pgup pgdn scroll · q quit    {}",
                 self.root.display()
             ),
         };
@@ -402,6 +486,30 @@ mod tests {
         assert!(Config::load(&root).unwrap().playlists.is_empty());
         assert!(!app.key(KeyCode::Char('q')));
         fs::remove_dir_all(&root).unwrap();
+    }
+
+    #[test]
+    fn scrolls_and_draws() {
+        let mut app = App::new(env::temp_dir(), Config::default());
+        let mut terminal = ratatui::Terminal::new(ratatui::backend::TestBackend::new(100, 30)).unwrap();
+        for i in 0..50 {
+            app.push_log(format!("line {i}"));
+        }
+        app.key(KeyCode::Tab);
+        app.key(KeyCode::Tab);
+        assert!(app.focus == Pane::Log);
+        app.key(KeyCode::Up);
+        app.push_log("line 50".into());
+        assert_eq!(app.log_scroll, 2);
+        // Scrolling past the top stops at the oldest line.
+        app.key(KeyCode::Home);
+        terminal.draw(|f| app.draw(f)).unwrap();
+        assert_eq!(app.log_scroll, 51 - 8);
+        app.key(KeyCode::End);
+        assert_eq!(app.log_scroll, 0);
+        app.key(KeyCode::BackTab);
+        assert!(app.focus == Pane::Tracks);
+        terminal.draw(|f| app.draw(f)).unwrap();
     }
 
     #[test]
